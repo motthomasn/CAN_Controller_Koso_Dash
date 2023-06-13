@@ -15,9 +15,11 @@
 /*
  * CBR015-0026_DASH_CONTROLLER_ASSY_CODE
  * Version 1.0  03-06-2020
+ * Version 2.0  05-06-2023      CAN IDs updated to match CAN config v3.0
+ *                              Shift lights functionality added
  * 
  * This code is designed for use with the CBR015-0026 DASH CONTROLLER ASSY utilising CBR015-0027 Rev00 PCB layout
- * CAN Config: 200507_LOGGER_CAN_CONFIG_v2.0.xlsx
+ * CAN Config: CBR250RRi_CAN_CONFIG_v3.0.dbc
  * Messages recieved via CAN are MSB First or Big Endian byte order
  * 
  * See documentation for details & overview
@@ -30,19 +32,23 @@
 // ===============================================================================================================
 // Declare constants most likely to be adjusted by user in this block
 
-#define TACHUpdateFreq 50 // Tach output update rate in Hz
-#define VSSUpdateFreq 5   // VSS output update rate in Hz
-#define IndUpdateFreq 2   // Indicators output update rate in Hz
-#define can_speed 500000  // CAN-Bus baud rate in bps
+#define TACHUpdatePeriod 20000      // Tach output update rate in µs
+#define VSSUpdatePeriod 200000      // VSS output update rate in µs
+#define IndUpdatePeriod 500000      // Indicators output update rate in µs
+#define can_speed 500000            // CAN-Bus baud rate in bps
 
-#define RPMmin 50 // minimum engine speed before outputting signal
-#define VSSmin 3  // minimum vehicle speed before outputting signal in kph
-#define circ 2    // tyre circumference in metres
-#define pulses 4  // VSS pulses per rev
+#define RPMmin 50                   // minimum engine speed before outputting signal
+#define VSSmin 3                    // minimum vehicle speed before outputting signal in kph
+#define circ 2                      // tyre circumference in metres
+#define pulses 4                    // VSS pulses per rev
 
-// limits
-#define OILPmin 300   // mBarA, minimum oil pressure for oil light switching
-#define errorFlagmax 2 // maximum value of error flags allowed before illuminating EOBD light. This is not used in v1.0. Instead
+#define SHIFTUpdatePeriod 50000     // Shift lights state update rate in µs
+#define SHIFTFlashPeriod 100000     // Shift lights flash rate in µs
+#define SHIFTGstage 1               // changeLightStage to switch on green shift light
+#define SHIFTYstage 2               // changeLightStage to switch on yellow shift light
+#define SHIFTRstage 3               // changeLightStage to switch on red shift light
+#define SHIFTBstage 4               // changeLightStage to switch on blue shift light
+#define SHIFTFstage 5               // changeLightStage to flash shift lights
 
 // ===============================================================================================================
 
@@ -64,30 +70,36 @@
 
 // Declare can bus and can messages
 static CAN_message_t rxmsg;
-#define filterID 0x600
-#define maskID 0x7FE
+// only interested in IDs 0x100, 0x101, 0x250
+#define filterID 0x000
+#define maskID 0x4AE
 
 // Declare variables used by timers
-uint32_t PrevTACHUpdateMicros, PrevVSSUpdateMicros, PrevIndUpdateMicros, TACHUpdatePeriod, VSSUpdatePeriod, IndUpdatePeriod;
+uint32_t currentMicros;
+uint32_t PrevTACHUpdateMicros=0, PrevVSSUpdateMicros=0, PrevIndUpdateMicros=0, PrevSHIFTUpdateMicros=0, PrevSHIFTFlashMicros=0;
 
 // Declare variables used by dig out pins
 // TACH
-bool TACHpinState;
-uint32_t previousTACHpinMicros, TACHperiod;
-int16_t RPM;
+bool TACHpinState = LOW;
+uint32_t previousTACHpinMicros=0, TACHperiod=UINT32_MAX;
+int16_t RPM=0;
 
 // VSS
-bool VSSpinState;
-uint32_t previousVSSpinMicros, VSSperiod;
-float VSS;
+bool VSSpinState = LOW;
+uint32_t previousVSSpinMicros=0, VSSperiod=UINT32_MAX;
+float VSS=0, facVSSperiod;
 
 // EOBD
-uint16_t engineEnable;
-bool EOBDpinState;
+uint8_t engineEnable=0; // initialise at 0 => OK
+bool EOBDpinState=LOW;
 
 // OILP
-bool OILPpinState;
-int16_t OILP;
+bool OILPpinState=LOW;
+uint8_t lowEopLight=0; // initialise at 0 => OFF
+
+// Shift Lights
+uint8_t changeLightStage=0;
+bool shiftGState=LOW, shiftYState=LOW, shiftRState=LOW, shiftBState=LOW, shiftFlashState=LOW;
 
 float ECT, EOT;
 
@@ -160,15 +172,19 @@ void can_recieve()
     switch (rxmsg.id)
     {
 
-    case 0x600:
+    case 0x100:
       RPM = ((int16_t((rxmsg.buf[1]) | (rxmsg.buf[0] << 8))));         //rpm
       VSS = ((int16_t((rxmsg.buf[3]) | (rxmsg.buf[2] << 8))) * 0.036); //kph
       break;
-    case 0x601:
+    case 0x101:
+      changeLightStage = uint8_t(rxmsg.buf[1]);
+      // changeLightState = uint8_t(rxmsg.buf[3]);
+      lowEopLight = uint8_t(rxmsg.buf[5]);
+      engineEnable = uint8_t(rxmsg.buf[7]);
+      break;
+    case 0x250:
       ECT = ((int16_t((rxmsg.buf[1]) | (rxmsg.buf[0] << 8))) * 0.1); //degC
       EOT = ((int16_t((rxmsg.buf[3]) | (rxmsg.buf[2] << 8))) * 0.1); //degC
-      OILP = ((int16_t((rxmsg.buf[5]) | (rxmsg.buf[4] << 8))));      //mBarA
-      engineEnable = ((uint16_t((rxmsg.buf[7]) | (rxmsg.buf[6] << 8))));
       break;
     }
   }
@@ -179,14 +195,13 @@ void UpdateIndicators()
 {
 
   // check oil pressure and set pin state
-  if ((OILP < OILPmin) && (OILPpinState == LOW))
+  if ( ( (lowEopLight == 1) || (engineEnable == 100) ) && (OILPpinState == LOW) )
   {
     // only change & write pin state if required
-    Serial.println("OilP Low");
     OILPpinState = HIGH;
     digitalWrite(OILPpin, OILPpinState);
   }
-  else if ((OILP > OILPmin) && (OILPpinState == HIGH))
+  else if ( (lowEopLight == 0) && (engineEnable != 100) && (OILPpinState == HIGH) )
   {
     OILPpinState = LOW;
     digitalWrite(OILPpin, OILPpinState);
@@ -256,7 +271,7 @@ void TACHupdate()
   }
   else
   {
-    TACHperiod = (30000000 / RPM); // confirm dash settings and calculation. Should match Screen 7, P - 1, High impulse.
+    TACHperiod = (30000000 / RPM); // Should match Screen 7, P - 1, High impulse.
   }
 }
 
@@ -272,7 +287,80 @@ void VSSupdate()
   }
   else
   {
-    VSSperiod = ((1800000 * circ) / (VSS * pulses)); // confirm dash settings and calculation. Also consider moving most of the calculation to setup so this step is an operation with only 2 variables
+    VSSperiod = facVSSperiod / VSS;
+  }
+}
+
+// ===============================================================================================================
+void shiftLightsFlash()
+{
+  // flashes all shift lights
+  shiftFlashState = !shiftFlashState; // switch state
+  shiftGState = shiftFlashState;
+  shiftYState = shiftFlashState;
+  shiftRState = shiftFlashState;
+  shiftBState = shiftFlashState;
+
+  digitalWrite(SHIFTGpin, shiftGState);
+  digitalWrite(SHIFTYpin, shiftYState);
+  digitalWrite(SHIFTRpin, shiftRState);
+  digitalWrite(SHIFTBpin, shiftBState);
+  
+}
+
+// ===============================================================================================================
+void shiftLights()
+{
+  // Flash
+  if (changeLightStage >= SHIFTFstage) {
+    if (currentMicros - PrevSHIFTFlashMicros > SHIFTFlashPeriod)
+    {
+      PrevSHIFTFlashMicros = currentMicros;
+      shiftLightsFlash();
+    }
+  }
+  else {
+    shiftFlashState = LOW;
+
+    // Green
+    if ( (changeLightStage >= SHIFTGstage) && (shiftGState==LOW) ) {
+      shiftGState = HIGH;
+      digitalWrite(SHIFTGpin, HIGH);
+    }
+    else if ( (changeLightStage < SHIFTGstage) && (shiftGState==HIGH) ) {
+      shiftGState = LOW;
+      digitalWrite(SHIFTGpin, LOW);
+    }
+
+    // Yellow
+    if ( (changeLightStage >= SHIFTYstage) && (shiftYState==LOW) ) {
+      shiftYState = HIGH;
+      digitalWrite(SHIFTYpin, HIGH);
+    }
+    else if ( (changeLightStage < SHIFTYstage) && (shiftYState==HIGH) ) {
+      shiftYState = LOW;
+      digitalWrite(SHIFTYpin, LOW);
+    }
+
+    // Red
+    if ( (changeLightStage >= SHIFTRstage) && (shiftRState==LOW) ) {
+      shiftRState = HIGH;
+      digitalWrite(SHIFTRpin, HIGH);
+    }
+    else if ( (changeLightStage < SHIFTRstage) && (shiftRState==HIGH) ) {
+      shiftRState = LOW;
+      digitalWrite(SHIFTRpin, LOW);
+    }
+
+    // Blue
+    if ( (changeLightStage >= SHIFTBstage) && (shiftBState==LOW) ) {
+      shiftBState = HIGH;
+      digitalWrite(SHIFTBpin, HIGH);
+    }
+    else if ( (changeLightStage < SHIFTBstage) && (shiftBState==HIGH) ) {
+      shiftBState = LOW;
+      digitalWrite(SHIFTBpin, LOW);
+    }
   }
 }
 
@@ -280,7 +368,7 @@ void VSSupdate()
 void setup()
 {
 
-  //Serial.begin(115200); // only used for USB debugging
+  // Serial.begin(115200); // only used for USB debugging
 
   // CAN setup
   CAN_filter_t filter;
@@ -313,30 +401,11 @@ void setup()
   pinMode(SHIFTRpin, OUTPUT);
   pinMode(SHIFTBpin, OUTPUT);
 
-  // Calculate update periods
-  TACHUpdatePeriod = (1000000 / TACHUpdateFreq);
-  VSSUpdatePeriod = (1000000 / VSSUpdateFreq);
-  IndUpdatePeriod = (1000000 / IndUpdateFreq);
-
   // calculate min resistance for AD5235
   Rmin = 250000.0 / 1024.0;
 
-  // initialise variables before they are updated within the loop
-  PrevTACHUpdateMicros = 0;
-  PrevVSSUpdateMicros = 0;
-  PrevIndUpdateMicros = 0;
-  TACHpinState = LOW;
-  previousTACHpinMicros = 0;
-  TACHperiod = 2147483647; // initialise at max to avoid triggering
-  RPM = 0;
-  VSSpinState = LOW;
-  previousVSSpinMicros = 0;
-  VSSperiod = 2147483647; // initialise at max to avoid triggering
-  VSS = 0;
-  engineEnable = 0; // initialise at 0 => OK
-  EOBDpinState = LOW;
-  OILP = 0;
-  OILPpinState = LOW;
+  // calculate factor to convert VSS to required pulse period
+  facVSSperiod = ( ( 1800000 * circ ) / pulses );
 }
 
 // ===============================================================================================================
@@ -345,7 +414,7 @@ void loop()
 
   can_recieve(); // Carry out CAN recieve function as often as possible
 
-  uint32_t currentMicros = micros();
+  currentMicros = micros();
 
   // Debug only
   //Serial.print("rpm: ");
@@ -370,6 +439,11 @@ void loop()
   {
     PrevVSSUpdateMicros = currentMicros;
     VSSupdate();
+  }
+  if (currentMicros - PrevSHIFTUpdateMicros > SHIFTUpdatePeriod)
+  {
+    PrevSHIFTUpdateMicros = currentMicros;
+    shiftLights();
   }
   if (currentMicros - PrevIndUpdateMicros > IndUpdatePeriod)
   {
