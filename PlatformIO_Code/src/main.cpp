@@ -22,10 +22,11 @@
  *                              Selectable measurement display in place of vehicle speed
  *                              Auto adjustment of shift light LED brighness depending on ambient light conditions
  *                              Added CAN transmission of light intensity value and LED PWM duty cycle
+ * Version 3.1  04-11-2025      Added shift lights test mode via CAN message     
  * 
  * 
  * This code is designed for use with the CBR015-0026 DASH CONTROLLER ASSY utilising CBR015-0027 Rev02 PCB layout
- * CAN Config: CBR250RRi_CAN_CONFIG_v3.5.dbc
+ * CAN Config: CBR250RRi_CAN_CONFIG_v3.6.dbc
  * Messages recieved via CAN are MSB First or Big Endian byte order
  * 
  * See documentation for details & overview
@@ -80,17 +81,19 @@
 #define ROTARY2pin 16
 
 // Define light to LED brightness relationship
-#define LIGHT_BUFFER_SIZE 5  // Buffer 5 brightness readings
-#define darkness 0      // light sensor reading corresponding to darkness (min 0)
-#define sunlight 1023   // light sensor reading corresponding to bright sunlight (max 1023)
-#define dimLED 1       // LED PWM duty for darkness (min 0)
-#define brightLED 255   // LED PWM duty for direct sunlight (max 255)
+#define LIGHT_BUFFER_SIZE 5   // Buffer 5 brightness readings
+#define darkness 17           // light sensor reading corresponding to darkness (min 0)
+#define sunlight 734          // light sensor reading corresponding to bright sunlight (max 1023)
+#define dimLED 1              // LED PWM duty for darkness (min 0)
+#define brightLED 255         // LED PWM duty for direct sunlight (max 255)
 
 // Declare can bus and can messages
 static CAN_message_t rxmsg;
-// only interested in IDs 0x100, 0x101, 0x250
-#define filterID 0x000
-#define maskID 0x4AE
+// only interested in IDs 0x100, 0x101, 0x250, 0x7F0
+#define filterID1 0x000
+#define maskID1 0x4AE
+#define filterID2 0x7F0
+#define maskID2 0x7FF
 #define txID 0x750      // message ID for light intensity value
 static CAN_message_t txmsg;
 
@@ -122,7 +125,7 @@ uint8_t lowEopLight=0; // initialise at 0 => OFF
 uint8_t changeLightStage=0, ledPWM=0;
 uint16_t ambLight;
 CircularBuffer<uint16_t, LIGHT_BUFFER_SIZE> lightBuffer;
-bool shiftGState=LOW, shiftYState=LOW, shiftRState=LOW, shiftBState=LOW, shiftFlashState=LOW;
+bool shiftGState=LOW, shiftYState=LOW, shiftRState=LOW, shiftBState=LOW, shiftFlashState=LOW, shiftTest=false;
 
 float ECT, EOT;
 uint8_t TPS=0, GEAR=2;
@@ -219,7 +222,11 @@ void can_recieve()
       VSS = uint8_t(round((int16_t((rxmsg.buf[3]) | (rxmsg.buf[2] << 8))) * 0.036)); //kph No decimal place display on speedometer
       break;
     case 0x101:
-      changeLightStage = uint8_t(rxmsg.buf[1]);
+      if (!shiftTest)
+      {
+        // ignore changeLightStage from ECU if test mode active
+        changeLightStage = uint8_t(rxmsg.buf[1]); 
+      }
       // changeLightState = uint8_t(rxmsg.buf[3]);
       lowEopLight = uint8_t(rxmsg.buf[5]);
       engineEnable = uint8_t(rxmsg.buf[7]);
@@ -230,6 +237,13 @@ void can_recieve()
       TPS = uint8_t(round((int16_t((rxmsg.buf[5]) | (rxmsg.buf[4] << 8))) * 0.012207031)); //% No decimal place display on speedometer
       GEAR = uint8_t(rxmsg.buf[7]);
       break;
+    case 0x7F0:
+      shiftTest = bool( 1 & rxmsg.buf[0] ); // bitwise AND to extract bit 0
+      if (shiftTest)
+      {
+        // update changeLightStage from tester message if bit0 active
+        changeLightStage = uint8_t(rxmsg.buf[0] >> 1); // right shift by 1 to remove bit 0 request
+      }
     }
   }
 }
@@ -468,17 +482,26 @@ void setup()
   // Serial.begin(115200); // only used for USB debugging
 
   // CAN setup
-  CAN_filter_t filter;
-  filter.id = filterID;
-  filter.ext = 0; //defines if filter is extended or standard frame. 0 = std, 1 = extended
-  filter.rtr = 0;
+  CAN_filter_t filter1;
+  filter1.id = filterID1;
+  filter1.ext = 0; //defines if filter is extended or standard frame. 0 = std, 1 = extended
+  filter1.rtr = 0;
+
+  CAN_filter_t filter2;
+  filter2.id = filterID2;
+  filter2.ext = 0; //defines if filter is extended or standard frame. 0 = std, 1 = extended
+  filter2.rtr = 0;
 
   Can0.begin(can_speed);
 
-  for (uint8_t filterNum = 0; filterNum < 14; filterNum++)
+  Can0.setMask(maskID2 << 18, 0); //bitshift is necessary for 11-bit id's
+  Can0.setFilter(filter2, 0);
+
+  // all filters must be populated so just set the remaining ones the same
+  for (uint8_t filterNum = 1; filterNum < 14; filterNum++)
   {
-    Can0.setMask(maskID << 18, filterNum); //bitshift is necessary for 11-bit id's
-    Can0.setFilter(filter, filterNum);
+    Can0.setMask(maskID1 << 18, filterNum); //bitshift is necessary for 11-bit id's
+    Can0.setFilter(filter1, filterNum);
   }
 
   // SPI Setup
@@ -566,6 +589,11 @@ void loop()
   if (currentMicros - PrevSHIFTUpdateMicros > SHIFTUpdatePeriod) 
   {
     PrevSHIFTUpdateMicros = currentMicros;
+    // Serial.print("Test active: ");
+    // Serial.println(shiftTest);
+    // Serial.print("Shift light stage: ");
+    // Serial.println(changeLightStage);
+
     shiftLights();
   }
   if (currentMicros - PrevIndUpdateMicros > IndUpdatePeriod)
