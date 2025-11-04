@@ -17,9 +17,15 @@
  * Version 1.0  03-06-2020
  * Version 2.0  05-06-2023      CAN IDs updated to match CAN config v3.0
  *                              Shift lights functionality added
+ * Version 3.0  29-10-2023      Code adjusted to suit Rev02 PCB layout & functionality
+ *                              CAN Rx adjusted to match CAN config v3.1
+ *                              Selectable measurement display in place of vehicle speed
+ *                              Auto adjustment of shift light LED brighness depending on ambient light conditions
+ *                              Added CAN transmission of light intensity value and LED PWM duty cycle
  * 
- * This code is designed for use with the CBR015-0026 DASH CONTROLLER ASSY utilising CBR015-0027 Rev00 PCB layout
- * CAN Config: CBR250RRi_CAN_CONFIG_v3.0.dbc
+ * 
+ * This code is designed for use with the CBR015-0026 DASH CONTROLLER ASSY utilising CBR015-0027 Rev02 PCB layout
+ * CAN Config: CBR250RRi_CAN_CONFIG_v3.5.dbc
  * Messages recieved via CAN are MSB First or Big Endian byte order
  * 
  * See documentation for details & overview
@@ -28,6 +34,7 @@
 #include <Arduino.h>
 #include <FlexCAN.h>
 #include <SPI.h>
+#include <CircularBuffer.hpp>
 
 // ===============================================================================================================
 // Declare constants most likely to be adjusted by user in this block
@@ -38,12 +45,13 @@
 #define can_speed 500000            // CAN-Bus baud rate in bps
 
 #define RPMmin 50                   // minimum engine speed before outputting signal
-#define VSSmin 3                    // minimum vehicle speed before outputting signal in kph
+#define VSSmin 1                    // minimum vehicle speed before outputting signal in kph
 #define circ 2                      // tyre circumference in metres
 #define pulses 4                    // VSS pulses per rev
 
 #define SHIFTUpdatePeriod 50000     // Shift lights state update rate in µs
-#define SHIFTFlashPeriod 100000     // Shift lights flash rate in µs
+#define SHIFTFlashPeriod 50000      // Shift lights flash rate in µs
+#define brightnessCheck 1000000     // Frequncy to check ambient light brightness in µs, 1s
 #define SHIFTGstage 1               // changeLightStage to switch on green shift light
 #define SHIFTYstage 2               // changeLightStage to switch on yellow shift light
 #define SHIFTRstage 3               // changeLightStage to switch on red shift light
@@ -63,20 +71,32 @@
 #define VSSpin 15
 #define EOBDpin 19
 #define OILPpin 20
-#define SHIFTGpin 5
-#define SHIFTYpin 0
-#define SHIFTRpin 1
-#define SHIFTBpin 2
+#define SHIFTGpin 9
+#define SHIFTYpin 6
+#define SHIFTRpin 5
+#define SHIFTBpin 23
+#define LIGHTpin A3
+#define ROTARY1pin 8
+#define ROTARY2pin 16
+
+// Define light to LED brightness relationship
+#define LIGHT_BUFFER_SIZE 5  // Buffer 5 brightness readings
+#define darkness 0      // light sensor reading corresponding to darkness (min 0)
+#define sunlight 1023   // light sensor reading corresponding to bright sunlight (max 1023)
+#define dimLED 1       // LED PWM duty for darkness (min 0)
+#define brightLED 255   // LED PWM duty for direct sunlight (max 255)
 
 // Declare can bus and can messages
 static CAN_message_t rxmsg;
 // only interested in IDs 0x100, 0x101, 0x250
 #define filterID 0x000
 #define maskID 0x4AE
+#define txID 0x750      // message ID for light intensity value
+static CAN_message_t txmsg;
 
 // Declare variables used by timers
 uint32_t currentMicros;
-uint32_t PrevTACHUpdateMicros=0, PrevVSSUpdateMicros=0, PrevIndUpdateMicros=0, PrevSHIFTUpdateMicros=0, PrevSHIFTFlashMicros=0;
+uint32_t PrevTACHUpdateMicros=0, PrevVSSUpdateMicros=0, PrevIndUpdateMicros=0, PrevSHIFTUpdateMicros=0, PrevSHIFTFlashMicros=0, PrevBrightCheckMicros=0, PrevCANtxMicros=0;
 
 // Declare variables used by dig out pins
 // TACH
@@ -87,7 +107,8 @@ int16_t RPM=0;
 // VSS
 bool VSSpinState = LOW;
 uint32_t previousVSSpinMicros=0, VSSperiod=UINT32_MAX;
-float VSS=0, facVSSperiod;
+float facVSSperiod;
+uint8_t VSS=0, *VSSdisp;
 
 // EOBD
 uint8_t engineEnable=0; // initialise at 0 => OK
@@ -98,10 +119,13 @@ bool OILPpinState=LOW;
 uint8_t lowEopLight=0; // initialise at 0 => OFF
 
 // Shift Lights
-uint8_t changeLightStage=0;
+uint8_t changeLightStage=0, ledPWM=0;
+uint16_t ambLight;
+CircularBuffer<uint16_t, LIGHT_BUFFER_SIZE> lightBuffer;
 bool shiftGState=LOW, shiftYState=LOW, shiftRState=LOW, shiftBState=LOW, shiftFlashState=LOW;
 
 float ECT, EOT;
+uint8_t TPS=0, GEAR=2;
 
 // Declare AD5235
 // Source: https://forum.arduino.cc/index.php?topic=356088.0
@@ -149,6 +173,24 @@ uint8_t transferData(uint8_t data)
 }
 
 // ===============================================================================================================
+uint8_t PT65112(uint8_t pin1, uint8_t pin2)
+{
+  // function to read state of PT65112 rotary switch
+  pinMode(pin1, INPUT_PULLUP);
+  pinMode(pin2, INPUT_PULLUP);
+  bool state1 = !digitalRead(pin1); // invert truthism here as pins are active when pulled low
+  bool state2 = !digitalRead(pin2);
+
+  return state1 | (state2<<1);
+
+}
+
+union uint16_split {
+  uint16_t value;
+  uint8_t bytes[2];
+};
+
+// ===============================================================================================================
 void setWiper(uint8_t w, uint16_t value)
 {
   //SPI.beginTransaction(settingsA); // allow access to SPI bus
@@ -174,7 +216,7 @@ void can_recieve()
 
     case 0x100:
       RPM = ((int16_t((rxmsg.buf[1]) | (rxmsg.buf[0] << 8))));         //rpm
-      VSS = ((int16_t((rxmsg.buf[3]) | (rxmsg.buf[2] << 8))) * 0.036); //kph
+      VSS = uint8_t(round((int16_t((rxmsg.buf[3]) | (rxmsg.buf[2] << 8))) * 0.036)); //kph No decimal place display on speedometer
       break;
     case 0x101:
       changeLightStage = uint8_t(rxmsg.buf[1]);
@@ -185,9 +227,53 @@ void can_recieve()
     case 0x250:
       ECT = ((int16_t((rxmsg.buf[1]) | (rxmsg.buf[0] << 8))) * 0.1); //degC
       EOT = ((int16_t((rxmsg.buf[3]) | (rxmsg.buf[2] << 8))) * 0.1); //degC
+      TPS = uint8_t(round((int16_t((rxmsg.buf[5]) | (rxmsg.buf[4] << 8))) * 0.012207031)); //% No decimal place display on speedometer
+      GEAR = uint8_t(rxmsg.buf[7]);
       break;
     }
   }
+}
+
+// ===============================================================================================================
+// CAN Send
+void CANsend()
+{
+  uint16_split light;
+  light.value = ambLight;
+
+  // ID 0x750
+  txmsg.buf[1] = light.bytes[0]; // LSB
+  txmsg.buf[0] = light.bytes[1]; // MSB
+
+  txmsg.buf[2] = ledPWM;
+
+  Can0.write(txmsg);
+}
+// ===============================================================================================================
+void shiftLBrightness()
+{
+  uint16_t lightReading = analogRead(LIGHTpin); // read light sensor pin
+
+  // add light reading to buffer. Buffer is used because there is a lot of variance in the light readings.
+  // i.e. shining a bright LED light directly at the sensor provides a generally high reading of ~1010 but these readings are often interspersed with readings of ~30 for 1 or 2 readings in between
+  lightBuffer.push(lightReading); 
+
+  ambLight = 0; // init
+  for (decltype(lightBuffer)::index_t i = 0; i < lightBuffer.size(); i++) {
+    // mathematically, max(a+b) = ( (a+b) + |(a-b)| ) / 2
+    ambLight = ( (ambLight+lightBuffer[i]) + abs((ambLight-lightBuffer[i])) ) / 2;
+  }
+
+  // Serial.print("Brightness reading: ");
+  // Serial.println(lightReading);
+  // Serial.print("Brightness buffer max: ");
+  // Serial.println(ambLight);
+
+  ambLight = constrain(ambLight, darkness, sunlight); // constrain readings to predefined limits
+
+  ledPWM = map(ambLight, darkness, sunlight, dimLED, brightLED); // determine corresponding PWM duty
+
+  CANsend();
 }
 
 // ===============================================================================================================
@@ -281,13 +367,13 @@ void VSSupdate()
 
   // calculate timer period for pulses
   // VSS
-  if (VSS < VSSmin)
+  if (*VSSdisp <= VSSmin)
   {
     VSSperiod = UINT32_MAX;
   }
   else
   {
-    VSSperiod = facVSSperiod / VSS;
+    VSSperiod = facVSSperiod / *VSSdisp;
   }
 }
 
@@ -301,10 +387,21 @@ void shiftLightsFlash()
   shiftRState = shiftFlashState;
   shiftBState = shiftFlashState;
 
-  digitalWrite(SHIFTGpin, shiftGState);
-  digitalWrite(SHIFTYpin, shiftYState);
-  digitalWrite(SHIFTRpin, shiftRState);
-  digitalWrite(SHIFTBpin, shiftBState);
+  uint8_t pwm;
+
+  if (shiftFlashState==HIGH)
+  {
+    pwm = ledPWM;
+  }
+  else
+  {
+    pwm = 0;
+  }
+
+  analogWrite(SHIFTGpin, pwm);
+  analogWrite(SHIFTYpin, pwm);
+  analogWrite(SHIFTRpin, pwm);
+  analogWrite(SHIFTBpin, pwm);
   
 }
 
@@ -325,41 +422,41 @@ void shiftLights()
     // Green
     if ( (changeLightStage >= SHIFTGstage) && (shiftGState==LOW) ) {
       shiftGState = HIGH;
-      digitalWrite(SHIFTGpin, HIGH);
+      analogWrite(SHIFTGpin, ledPWM);
     }
     else if ( (changeLightStage < SHIFTGstage) && (shiftGState==HIGH) ) {
       shiftGState = LOW;
-      digitalWrite(SHIFTGpin, LOW);
+      analogWrite(SHIFTGpin, 0);
     }
 
     // Yellow
     if ( (changeLightStage >= SHIFTYstage) && (shiftYState==LOW) ) {
       shiftYState = HIGH;
-      digitalWrite(SHIFTYpin, HIGH);
+      analogWrite(SHIFTYpin, ledPWM);
     }
     else if ( (changeLightStage < SHIFTYstage) && (shiftYState==HIGH) ) {
       shiftYState = LOW;
-      digitalWrite(SHIFTYpin, LOW);
+      analogWrite(SHIFTYpin, 0);
     }
 
     // Red
     if ( (changeLightStage >= SHIFTRstage) && (shiftRState==LOW) ) {
       shiftRState = HIGH;
-      digitalWrite(SHIFTRpin, HIGH);
+      analogWrite(SHIFTRpin, ledPWM);
     }
     else if ( (changeLightStage < SHIFTRstage) && (shiftRState==HIGH) ) {
       shiftRState = LOW;
-      digitalWrite(SHIFTRpin, LOW);
+      analogWrite(SHIFTRpin, 0);
     }
 
     // Blue
     if ( (changeLightStage >= SHIFTBstage) && (shiftBState==LOW) ) {
       shiftBState = HIGH;
-      digitalWrite(SHIFTBpin, HIGH);
+      analogWrite(SHIFTBpin, ledPWM);
     }
     else if ( (changeLightStage < SHIFTBstage) && (shiftBState==HIGH) ) {
       shiftBState = LOW;
-      digitalWrite(SHIFTBpin, LOW);
+      analogWrite(SHIFTBpin, 0);
     }
   }
 }
@@ -367,7 +464,7 @@ void shiftLights()
 // ===============================================================================================================
 void setup()
 {
-
+  delay(5000);
   // Serial.begin(115200); // only used for USB debugging
 
   // CAN setup
@@ -400,12 +497,38 @@ void setup()
   pinMode(SHIFTYpin, OUTPUT);
   pinMode(SHIFTRpin, OUTPUT);
   pinMode(SHIFTBpin, OUTPUT);
+  pinMode(LIGHTpin, INPUT);
+
+  // Read state of rotary switch & point to different variable depending on state.
+  uint8_t swtState = PT65112(ROTARY1pin, ROTARY2pin);
+  // Serial.print("Switch state: ");
+  // Serial.println(swtState); // swtState not working. Always shows 0
+
+  switch (swtState)
+  {
+    case 0:
+      VSSdisp = &VSS;
+      break;
+    case 1:
+      VSSdisp = &GEAR;
+      break;
+    case 2:
+      VSSdisp = &TPS;
+      break;
+  }
 
   // calculate min resistance for AD5235
   Rmin = 250000.0 / 1024.0;
 
   // calculate factor to convert VSS to required pulse period
   facVSSperiod = ( ( 1800000 * circ ) / pulses );
+
+  txmsg.id = txID;
+  txmsg.len = 8;
+
+  // get required shift lights brightness before entering loops
+  shiftLBrightness();
+
 }
 
 // ===============================================================================================================
@@ -440,7 +563,7 @@ void loop()
     PrevVSSUpdateMicros = currentMicros;
     VSSupdate();
   }
-  if (currentMicros - PrevSHIFTUpdateMicros > SHIFTUpdatePeriod)
+  if (currentMicros - PrevSHIFTUpdateMicros > SHIFTUpdatePeriod) 
   {
     PrevSHIFTUpdateMicros = currentMicros;
     shiftLights();
@@ -461,5 +584,11 @@ void loop()
     //Serial.println(OILP);
     // End Debug
     UpdateIndicators();
+  }
+  if (currentMicros - PrevBrightCheckMicros > brightnessCheck)
+  {
+    PrevBrightCheckMicros = currentMicros;
+
+    shiftLBrightness();
   }
 }
